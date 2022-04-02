@@ -13,14 +13,22 @@
 #include <include/nanomq.h>
 #include <mqtt_db.h>
 #include <nng.h>
-#include <nng/protocol/mqtt/mqtt_parser.h>
+#include <nng/mqtt/packet.h>
 #include <zmalloc.h>
 
+#include "include/bridge.h"
 #include "include/pub_handler.h"
 #include "include/sub_handler.h"
+#include "nng/protocol/mqtt/mqtt_parser.h"
 
 #define ENABLE_RETAIN 1
-#define SUPPORT_MQTT5_0 0
+#define SUPPORT_MQTT5_0 1
+
+#ifdef STATISTICS
+static atomic_ullong g_message_in   = 0;
+static atomic_ullong g_message_out  = 0;
+static atomic_ullong g_message_drop = 0;
+#endif
 
 static char *bytes_to_str(const unsigned char *src, char *dest, int src_len);
 static void  print_hex(
@@ -33,141 +41,198 @@ void
 init_pipe_content(struct pipe_content *pipe_ct)
 {
 	debug_msg("pub_handler: init pipe_info");
-	pipe_ct->pipe_info     = NULL;
 	pipe_ct->total         = 0;
 	pipe_ct->current_index = 0;
-	pipe_ct->encode_msg    = encode_pub_message;
+	pipe_ct->msg_infos     = NULL;
 }
 
 void
 foreach_client(
     void **cli_ctx_list, nano_work *pub_work, struct pipe_content *pipe_ct)
 {
-	bool               equal = false;
+	bool      equal = false;
+	uint32_t  pids;
+	uint8_t   sub_qos;
+	int       ctx_list_len;
+	uint32_t *sub_id_p = NULL;
+
 	packet_subscribe * sub_pkt;
+	dbtree_ctxt *      db_ctxt = NULL;
 	struct client_ctx *ctx;
 	topic_node *       tn;
+	// Dont using msg info buf, Just for Cheat Compiler
+	mqtt_msg_info *msg_info, msg_info_buf;
 
-	int      ctx_list_len = cvector_size(cli_ctx_list);
-	uint32_t pids;
-	uint8_t  sub_qos;
+	cvector(mqtt_msg_info) msg_infos = pipe_ct->msg_infos;
+
+	ctx_list_len = cvector_size(cli_ctx_list);
 
 	for (int i = 0; i < ctx_list_len; i++) {
-		ctx     = (struct client_ctx *) cli_ctx_list[i];
-		pids    = ctx->pid.id;
-		tn      = ctx->sub_pkt->node;
-		sub_qos = 0; // default
+		db_ctxt  = (dbtree_ctxt *) cli_ctx_list[i];
+		ctx      = db_ctxt->ctxt;
+		sub_id_p = db_ctxt->sub_id_p;
 
-		if (tn != NULL) {
-			sub_qos = tn->it->qos;
-		}
+		dbtree_delete_ctxt(db_ctxt);
+		if (!ctx)
+			continue;
 
-		while (tn != NULL) {
-			if (0 ==
-			    strcmp(tn->it->topic_filter.body,
-			        pub_work->pub_packet->variable_header.publish
+#ifdef STATISTICS
+		ctx->recv_cnt++;
+		g_message_out++;
+#endif
+		pids = ctx->pid.id;
+		tn   = ctx->sub_pkt->node;
+
+		if (pids == 0)
+			continue;
+
+		char *sub_topic;
+		while (tn) {
+			sub_topic = tn->it->topic_filter.body;
+			if (sub_topic[0] == '$') {
+			       	if (!strncmp(sub_topic, "$share/", strlen("$share/"))) {
+					sub_topic = strchr(sub_topic, '/');
+					sub_topic++;
+					sub_topic = strchr(sub_topic, '/');
+					sub_topic++;
+				}
+
+			}
+
+			if (true ==
+			    topic_filter(sub_topic,
+			        pub_work->pub_packet->var_header.publish
 			            .topic_name.body)) {
-				sub_qos = tn->it->qos;
-				break;
+				break; // find the topic
 			}
 			tn = tn->next;
 		}
-
-		if (pids == 0) {
+		if (!tn) {
+			debug_msg("Not find the topic node");
 			continue;
 		}
-		pipe_ct->pipe_info = zrealloc(pipe_ct->pipe_info,
-		    sizeof(struct pipe_info) * (pipe_ct->total + 1));
+		sub_qos = tn->it->qos;
+		// no local
+		if (1 == tn->it->no_local) {
+			if (pids == pub_work->pid.id) {
+				continue;
+			}
+		}
 
-		pipe_ct->pipe_info[pipe_ct->total].index = pipe_ct->total;
-		pipe_ct->pipe_info[pipe_ct->total].pipe  = pids;
-		pipe_ct->pipe_info[pipe_ct->total].cmd   = PUBLISH;
-		pipe_ct->pipe_info[pipe_ct->total].work  = pub_work;
-		pipe_ct->pipe_info[pipe_ct->total].qos =
-		    pub_work->pub_packet->fixed_header.qos <= sub_qos
-		    ? pub_work->pub_packet->fixed_header.qos
-		    : sub_qos;
+		cvector_push_back(msg_infos, msg_info_buf);
+		size_t csize = cvector_size(msg_infos);
+		msg_info = (mqtt_msg_info *) &msg_infos[csize-1];
 
-		pipe_ct->total += 1;
+		msg_info->pipe = pids;
+		msg_info->qos  = sub_qos;
+		if (0 == tn->it->rap)
+			msg_info->retain = 0;
+		else
+			msg_info->retain =
+			    pub_work->pub_packet->fixed_header.retain;
+		if (sub_id_p) {
+			msg_info->sub_id = sub_id_p[0];
+			cvector_free(sub_id_p);
+		}
 	}
+	pipe_ct->msg_infos = msg_infos;
 }
 
 void
-handle_pub(nano_work *work, struct pipe_content *pipe_ct)
+handle_pub(nano_work *work, struct pipe_content *pipe_ct, uint8_t proto)
 {
-	char **topic_queue = NULL;
+	char **topic_queue     = NULL;
+	void **cli_ctx_list    = NULL;
+	void **shared_cli_list = NULL;
+	size_t msg_cnt         = 0;
+	char * topic           = NULL;
+	pipe_ct->msg_infos = NULL;
 
-	work->pub_packet = (struct pub_packet_struct *) nng_alloc(
+
+#ifdef STATISTICS
+	g_message_in++;
+#endif
+	if (proto == 0) {
+		proto = conn_param_get_protover(work->cparam);
+	}
+
+	work->pub_packet = (struct pub_packet_struct *) nng_zalloc(
 	    sizeof(struct pub_packet_struct));
 
-	reason_code result = decode_pub_message(work);
+	reason_code result = decode_pub_message(work, proto);
 	if (SUCCESS != result) {
 		debug_msg("decode message failed.");
 		return;
 	}
 
-	// TODO no local
-	if (PUBLISH == work->pub_packet->fixed_header.packet_type) {
-		void **cli_ctx_list = NULL;
-		void **shared_cli_list = NULL;
-		size_t msg_cnt      = 0;
-		if (work->pub_packet->fixed_header.qos > 0) {
-			cli_ctx_list =
-			    dbtree_find_clients_and_cache_msg(work->db,
-			        work->pub_packet->variable_header.publish
-			            .topic_name.body,
-			        work->msg, &msg_cnt);
-			// Note. Why do we clone msg (msg_cnt-1) times?
-			// It's because that the refcnt of msg is 1, when
-			// plus (msg_cnt-1), equals (msg_cnt), and it means
-			// the count of session which the msg would be sent to.
-			for (int i = 0; i < (int) (msg_cnt); i++) {
-				nng_msg_clone(work->msg);
-			}
+	if (PUBLISH != work->pub_packet->fixed_header.packet_type) {
+		return;
+	}
 
-			shared_cli_list = dbtree_find_shared_sub_clients(work->db,
-			        work->pub_packet->variable_header.publish
-			            .topic_name.body,
-			        work->msg, &msg_cnt);
-			// Note. Why do we clone msg (msg_cnt-1) times?
-			// It's because that the refcnt of msg is 1, when
-			// plus (msg_cnt-1), equals (msg_cnt), and it means
-			// the count of session which the msg would be sent to.
-			for (int i = 0; i < (int) (msg_cnt - 1); i++) {
-				nng_msg_clone(work->msg);
+	if (proto == PROTOCOL_VERSION_v5) {
+		property_data *pdata = property_get_value(
+		    work->pub_packet->var_header.publish.properties,
+		    TOPIC_ALIAS);
+		if (work->pub_packet->var_header.publish.topic_name.len > 0) {
+			if (pdata) {
+				dbhash_insert_atpair(work->pid.id,
+				    pdata->p_value.u16,
+				    work->pub_packet->var_header.publish
+				        .topic_name.body);
 			}
-
 		} else {
-			cli_ctx_list =
-			    dbtree_find_clients_and_cache_msg(work->db,
-			        work->pub_packet->variable_header.publish
-			            .topic_name.body,
-			        NULL, &msg_cnt);
-
-			shared_cli_list = dbtree_find_shared_sub_clients(work->db,
-			        work->pub_packet->variable_header.publish
-			            .topic_name.body,
-			        NULL, &msg_cnt);
+			if (pdata) {
+				const char *tp = dbhash_find_atpair(
+				    work->pid.id, pdata->p_value.u16);
+				if (tp) {
+					work->pub_packet->var_header.publish
+					    .topic_name.body = strdup(tp);
+					work->pub_packet->var_header.publish
+					    .topic_name.len = strlen(tp);
+				}
+			}
 		}
+	}
 
+	topic = work->pub_packet->var_header.publish.topic_name.body;
 
-		if (cli_ctx_list != NULL) {
-			foreach_client(cli_ctx_list, work, pipe_ct);
+	cli_ctx_list =
+	    dbtree_find_clients_and_cache_msg(work->db, topic, NULL, &msg_cnt);
+
+	if (work->pub_packet->fixed_header.qos > 0) {
+		shared_cli_list = dbtree_find_shared_sub_clients(
+		    work->db, topic, work->msg, &msg_cnt);
+		// Note. We clone msg_cnt times for the session stored.
+		// There are msg_cnt sessions need to be sent.
+		for (int i = 0; i < (int) (msg_cnt); i++) {
+			nng_msg_clone(work->msg);
 		}
-		cvector_free(cli_ctx_list);
-		
-		if (shared_cli_list != NULL) {
-			foreach_client(shared_cli_list, work, pipe_ct);
-		}
-		cvector_free(shared_cli_list);
+	} else {
+		shared_cli_list = dbtree_find_shared_sub_clients(
+		    work->db, topic, NULL, &msg_cnt);
+	}
 
-		debug_msg("pipe_info size: [%d]", pipe_ct->total);
+
+#ifdef STATISTICS
+	if (cli_ctx_list == NULL && shared_cli_list == NULL) {
+		g_message_drop++;
+	}
+#endif
+
+	if (cli_ctx_list != NULL) {
+		foreach_client(cli_ctx_list, work, pipe_ct);
+	}
+	debug_msg("pipe_info size: [%ld]", cvector_size(cli_ctx_list));
+	cvector_free(cli_ctx_list);
+
+	if (shared_cli_list != NULL) {
+		foreach_client(shared_cli_list, work, pipe_ct);
+	}
+	cvector_free(shared_cli_list);
 
 #if ENABLE_RETAIN
-		handle_pub_retain(work,
-		    work->pub_packet->variable_header.publish.topic_name.body);
+	handle_pub_retain(work, topic);
 #endif
-	}
 	// TODO send DISCONNECT with reason_code if MQTT Version=5.0
 }
 
@@ -180,7 +245,7 @@ handle_pub_retain(const nano_work *work, char *topic)
 	if (work->pub_packet->fixed_header.retain) {
 		dbtree_retain_msg *r = NULL;
 
-		if (work->pub_packet->payload_body.payload_len > 0) {
+		if (work->pub_packet->payload.len > 0) {
 			retain      = nng_alloc(sizeof(dbtree_retain_msg));
 			retain->qos = work->pub_packet->fixed_header.qos;
 			nng_msg_clone(work->msg);
@@ -210,61 +275,41 @@ handle_pub_retain(const nano_work *work, char *topic)
 }
 #endif
 
-struct pub_packet_struct *
-copy_pub_packet(struct pub_packet_struct *src_pub_packet)
-{
-	struct pub_packet_struct *packet =
-	    nng_alloc(sizeof(struct pub_packet_struct));
-	packet->variable_header.publish.topic_name.body = nng_alloc(
-	    src_pub_packet->variable_header.publish.topic_name.len + 1);
-	memset(packet->variable_header.publish.topic_name.body, 0,
-	    src_pub_packet->variable_header.publish.topic_name.len + 1);
-	memcpy(packet->variable_header.publish.topic_name.body,
-	    src_pub_packet->variable_header.publish.topic_name.body,
-	    src_pub_packet->variable_header.publish.topic_name.len);
-	packet->variable_header.publish.topic_name.len =
-	    src_pub_packet->variable_header.publish.topic_name.len;
-
-	packet->payload_body.payload =
-	    nng_alloc(src_pub_packet->payload_body.payload_len + 1);
-	memset(packet->payload_body.payload, 0,
-	    src_pub_packet->payload_body.payload_len + 1);
-	memcpy(packet->payload_body.payload,
-	    src_pub_packet->payload_body.payload,
-	    src_pub_packet->payload_body.payload_len);
-	packet->payload_body.payload_len =
-	    src_pub_packet->payload_body.payload_len;
-	return packet;
-}
-
 void
 free_pub_packet(struct pub_packet_struct *pub_packet)
 {
 	if (pub_packet != NULL) {
 		if (pub_packet->fixed_header.packet_type == PUBLISH) {
-			if (pub_packet->variable_header.publish.topic_name
-			            .body != NULL &&
-			    pub_packet->variable_header.publish.topic_name
-			            .len > 0) {
-				nng_free(pub_packet->variable_header.publish
+			if (pub_packet->var_header.publish.topic_name.body !=
+			        NULL &&
+			    pub_packet->var_header.publish.topic_name.len >
+			        0) {
+				nng_free(pub_packet->var_header.publish
 				             .topic_name.body,
-				    pub_packet->variable_header.publish
-				            .topic_name.len +
+				    pub_packet->var_header.publish.topic_name
+				            .len +
 				        1);
-				pub_packet->variable_header.publish.topic_name
+				pub_packet->var_header.publish.topic_name
 				    .body = NULL;
-				pub_packet->variable_header.publish.topic_name
-				    .len = 0;
-				debug_msg("free memory topic");
+				pub_packet->var_header.publish.topic_name.len =
+				    0;
+				debug_msg("free topic");
 			}
 
-			if (pub_packet->payload_body.payload != NULL &&
-			    pub_packet->payload_body.payload_len > 0) {
-				nng_free(pub_packet->payload_body.payload,
-				    pub_packet->payload_body.payload_len + 1);
-				pub_packet->payload_body.payload     = NULL;
-				pub_packet->payload_body.payload_len = 0;
-				debug_msg("free memory payload");
+			if (pub_packet->var_header.publish.prop_len > 0) {
+				property_free(
+				    pub_packet->var_header.publish.properties);
+				pub_packet->var_header.publish.prop_len = 0;
+				debug_msg("free properties");
+			}
+
+			if (pub_packet->payload.len > 0 &&
+			    pub_packet->payload.data != NULL) {
+				nng_free(pub_packet->payload.data,
+				    pub_packet->payload.len + 1);
+				pub_packet->payload.data = NULL;
+				pub_packet->payload.len  = 0;
+				debug_msg("free payload");
 			}
 		}
 
@@ -275,12 +320,10 @@ free_pub_packet(struct pub_packet_struct *pub_packet)
 }
 
 void
-free_pipes_info(struct pipe_info *p_info)
+free_msg_infos(mqtt_msg_info *msg_infos)
 {
-	if (p_info != NULL) {
-		zfree(p_info);
-		p_info = NULL;
-		debug_msg("free pipes_info");
+	if (msg_infos != NULL) {
+		zfree(msg_infos);
 	}
 }
 
@@ -300,218 +343,86 @@ append_bytes_with_type(
 
 bool
 encode_pub_message(nng_msg *dest_msg, const nano_work *work,
-    mqtt_control_packet_types cmd, uint8_t sub_qos, bool dup)
+    mqtt_control_packet_types cmd, mqtt_msg_info *msg_info)
 {
 	uint8_t  tmp[4]     = { 0 };
 	uint32_t arr_len    = 0;
 	int      append_res = 0;
-	uint8_t  proto = 0;
+	uint8_t  proto      = 0;
 	uint32_t buf;
-	properties_type prop_type;
 
 	debug_msg("start encode message");
 
 	nng_msg_clear(dest_msg);
 	nng_msg_header_clear(dest_msg);
-	nng_msg_set_cmd_type(dest_msg, CMD_UNKNOWN);
+	if (nng_msg_cmd_type(dest_msg) == CMD_PUBLISH_V5) {
+		proto = PROTOCOL_VERSION_v5;
+	} else if (nng_msg_cmd_type(dest_msg) == CMD_PUBLISH) {
+		proto = PROTOCOL_VERSION_v311;
+	}
+
 	switch (cmd) {
 	case PUBLISH:
 		/*fixed header*/
-		nng_msg_set_cmd_type(dest_msg, CMD_PUBLISH);
 		work->pub_packet->fixed_header.packet_type = cmd;
-		// work->pub_packet->fixed_header.qos =
-		// work->pub_packet->fixed_header.qos < sub_qos ?
-		// work->pub_packet->fixed_header.qos : sub_qos;
-		work->pub_packet->fixed_header.dup = dup;
-		append_res                         = nng_msg_header_append(
-                    dest_msg, (uint8_t *) &work->pub_packet->fixed_header, 1);
+		// work->pub_packet->fixed_header.dup = dup;
+		append_res = nng_msg_header_append(
+		    dest_msg, (uint8_t *) &work->pub_packet->fixed_header, 1);
 
+		/*variable header*/
+		// topic name
+		if (work->pub_packet->var_header.publish.topic_name.len > 0) {
+			append_res = nng_msg_append_u16(dest_msg,
+			    work->pub_packet->var_header.publish.topic_name
+			        .len);
+
+			append_res = nng_msg_append(dest_msg,
+			    work->pub_packet->var_header.publish.topic_name
+			        .body,
+			    work->pub_packet->var_header.publish.topic_name
+			        .len);
+		}
+
+		// identifier
+		if (work->pub_packet->fixed_header.qos > 0) {
+			append_res = nng_msg_append_u16(dest_msg,
+			    work->pub_packet->var_header.publish.packet_id);
+		}
+		debug_msg("after topic and id len in msg already [%ld]",
+		    nng_msg_len(dest_msg));
+
+#if SUPPORT_MQTT5_0
+		if (PROTOCOL_VERSION_v5 == proto) {
+			if (encode_properties(dest_msg,
+			        work->pub_packet->var_header.publish
+			            .properties, CMD_PUBLISH) != 0) {
+				return false;
+			}
+			// rv = encode_properties(dest_msg, NULL);
+		}
+#endif
+
+		// payload
+		if (work->pub_packet->payload.len > 0) {
+			// nng_msg_set_payload_ptr(msg, nng_msg_body());
+			append_res = nng_msg_append(dest_msg,
+			    work->pub_packet->payload.data,
+			    work->pub_packet->payload.len);
+		}
+
+		debug_msg("after payload len in msg already [%ld]",
+		    nng_msg_len(dest_msg));
+
+		work->pub_packet->fixed_header.remain_len =
+		    nng_msg_len(dest_msg);
 		arr_len = put_var_integer(
 		    tmp, work->pub_packet->fixed_header.remain_len);
-
 		append_res = nng_msg_header_append(dest_msg, tmp, arr_len);
 		nng_msg_set_remaining_len(
 		    dest_msg, work->pub_packet->fixed_header.remain_len);
 		debug_msg("header len [%ld] remain len [%d]\n",
 		    nng_msg_header_len(dest_msg),
 		    work->pub_packet->fixed_header.remain_len);
-		/*variable header*/
-		// topic name
-		if (work->pub_packet->variable_header.publish.topic_name.len >
-		    0) {
-			append_res = nng_msg_append_u16(dest_msg,
-			    work->pub_packet->variable_header.publish
-			        .topic_name.len);
-
-			append_res = nng_msg_append(dest_msg,
-			    work->pub_packet->variable_header.publish
-			        .topic_name.body,
-			    work->pub_packet->variable_header.publish
-			        .topic_name.len);
-		}
-
-		// identifier
-		if (work->pub_packet->fixed_header.qos > 0) {
-			append_res = nng_msg_append_u16(dest_msg,
-			    work->pub_packet->variable_header.publish
-			        .packet_identifier);
-		}
-		debug_msg("after topic and id len in msg already [%ld]",
-		    nng_msg_len(dest_msg));
-
-#if SUPPORT_MQTT5_0
-		if (work->cparam) {
-			proto = conn_param_get_protover(work->cparam);
-		}
-
-		if (PROTOCOL_VERSION_v5 == proto) {
-			// properties
-			// properties length
-			memset(tmp, 0, sizeof(tmp));
-			arr_len = put_var_integer(tmp,
-			    work->pub_packet->variable_header.publish
-			        .properties.len);
-			nng_msg_append(dest_msg, tmp, arr_len);
-			debug_msg("arr_len [%d]", arr_len);
-
-			// Payload Format Indicator
-			if (work->pub_packet->variable_header.publish
-			        .properties.content.publish
-			        .payload_fmt_indicator.has_value) {
-				prop_type = PAYLOAD_FORMAT_INDICATOR;
-				nng_msg_append(dest_msg, &prop_type, 1);
-				nng_msg_append(dest_msg,
-				    &work->pub_packet->variable_header.publish
-				         .properties.content.publish
-				         .payload_fmt_indicator.value,
-				    sizeof(
-				        work->pub_packet->variable_header
-				            .publish.properties.content.publish
-				            .payload_fmt_indicator));
-			}
-
-			// Message Expiry Interval
-			if (work->pub_packet->variable_header.publish
-			        .properties.content.publish.msg_expiry_interval
-			        .has_value) {
-				prop_type = MESSAGE_EXPIRY_INTERVAL;
-				nng_msg_append(dest_msg, &prop_type, 1);
-				nng_msg_append_u32(dest_msg,
-				    work->pub_packet->variable_header.publish
-				        .properties.content.publish
-				        .msg_expiry_interval.value);
-			}
-
-			// Topic Alias
-			if (work->pub_packet->variable_header.publish
-			        .properties.content.publish.topic_alias
-			        .has_value) {
-				prop_type = TOPIC_ALIAS;
-				nng_msg_append(dest_msg, &prop_type, 1);
-				nng_msg_append_u16(dest_msg,
-				    work->pub_packet->variable_header.publish
-				        .properties.content.publish.topic_alias
-				        .value);
-			}
-
-			// Response Topic
-			if (work->pub_packet->variable_header.publish
-			        .properties.content.publish.response_topic
-			        .len > 0) {
-				append_bytes_with_type(dest_msg,
-				    RESPONSE_TOPIC,
-				    (uint8_t *) work->pub_packet
-				        ->variable_header.publish.properties
-				        .content.publish.response_topic.body,
-				    work->pub_packet->variable_header.publish
-				        .properties.content.publish
-				        .response_topic.len);
-			}
-
-			// Correlation Data
-			if (work->pub_packet->variable_header.publish
-			        .properties.content.publish.correlation_data
-			        .len > 0) {
-				append_bytes_with_type(dest_msg,
-				    CORRELATION_DATA,
-				    work->pub_packet->variable_header.publish
-				        .properties.content.publish
-				        .correlation_data.body,
-				    work->pub_packet->variable_header.publish
-				        .properties.content.publish
-				        .correlation_data.len);
-			}
-
-			// User Property
-			if (work->pub_packet->variable_header.publish
-			        .properties.content.publish.user_property
-			        .len_key > 0) {
-				append_bytes_with_type(dest_msg, USER_PROPERTY,
-				    (uint8_t *) work->pub_packet
-				        ->variable_header.publish.properties
-				        .content.publish.user_property.key,
-				    work->pub_packet->variable_header.publish
-				        .properties.content.publish
-				        .user_property.len_key);
-				nng_msg_append(dest_msg,
-				    (uint8_t *) work->pub_packet
-				        ->variable_header.publish.properties
-				        .content.publish.user_property.val,
-				    work->pub_packet->variable_header.publish
-				        .properties.content.publish
-				        .user_property.len_val);
-			}
-
-			// Subscription Identifier
-			if (work->pub_packet->variable_header.publish
-			        .properties.content.publish
-			        .subscription_identifier.has_value) {
-				prop_type = SUBSCRIPTION_IDENTIFIER;
-				nng_msg_append(dest_msg, &prop_type, 1);
-				memset(tmp, 0, sizeof(tmp));
-				arr_len = put_var_integer(tmp,
-				    work->pub_packet->variable_header.publish
-				        .properties.content.publish
-				        .subscription_identifier.value);
-				nng_msg_append(dest_msg, tmp, arr_len);
-			}
-
-			// CONTENT TYPE
-			if (work->pub_packet->variable_header.publish
-			        .properties.content.publish.content_type.len >
-			    0) {
-				append_bytes_with_type(dest_msg, CONTENT_TYPE,
-				    (uint8_t *) work->pub_packet
-				        ->variable_header.publish.properties
-				        .content.publish.content_type.body,
-				    work->pub_packet->variable_header.publish
-				        .properties.content.publish
-				        .content_type.len);
-			}
-		}
-		/* check */
-		else {
-			debug_msg("pro_ver [%d]", proto);
-		}
-#endif
-		debug_msg("property len in msg already [%ld]",
-		    nng_msg_len(dest_msg));
-
-		// payload
-		if (work->pub_packet->payload_body.payload_len > 0) {
-			// nng_msg_set_payload_ptr(msg, nng_msg_body());
-			append_res = nng_msg_append(dest_msg,
-			    work->pub_packet->payload_body.payload,
-			    work->pub_packet->payload_body.payload_len);
-			//				debug_msg("payload [%s]
-			// len
-			//[%d]", (char
-			//*)work->pub_packet->payload_body.payload,
-			// work->pub_packet->payload_body.payload_len);
-		}
-
-		debug_msg("after payload len in msg already [%ld]",
-		    nng_msg_len(dest_msg));
 		break;
 
 	case PUBREL:
@@ -525,13 +436,12 @@ encode_pub_message(nng_msg *dest_msg, const nano_work *work,
 		nng_msg_set_cmd_type(dest_msg, CMD_PUBCOMP);
 		struct pub_packet_struct pub_response = {
 			.fixed_header.packet_type = cmd,
-			.fixed_header.dup         = dup,
-			.fixed_header.qos         = 0,
-			.fixed_header.retain      = 0,
-			.fixed_header.remain_len  = 2, // TODO
-			.variable_header.pub_arrc.packet_identifier =
-			    work->pub_packet->variable_header.publish
-			        .packet_identifier
+			// .fixed_header.dup         = dup,
+			.fixed_header.qos        = 0,
+			.fixed_header.retain     = 0,
+			.fixed_header.remain_len = 2, // TODO
+			.var_header.pub_arrc.packet_id =
+			    work->pub_packet->var_header.publish.packet_id
 		};
 
 		/*fixed header*/
@@ -543,61 +453,18 @@ encode_pub_message(nng_msg *dest_msg, const nano_work *work,
 
 		/*variable header*/
 		// identifier
-		nng_msg_append_u16(dest_msg,
-		    pub_response.variable_header.pub_arrc.packet_identifier);
+		nng_msg_append_u16(
+		    dest_msg, pub_response.var_header.pub_arrc.packet_id);
 
 		// reason code
 		if (pub_response.fixed_header.remain_len > 2) {
 			uint8_t reason_code =
-			    pub_response.variable_header.pub_arrc.reason_code;
+			    pub_response.var_header.pub_arrc.reason_code;
 			nng_msg_append(dest_msg, (uint8_t *) &reason_code,
 			    sizeof(reason_code));
 
 #if SUPPORT_MQTT5_0
-			if (PROTOCOL_VERSION_v5 == proto) {
-				// properties
-				if (pub_response.fixed_header.remain_len >=
-				    4) {
-
-					memset(tmp, 0, sizeof(tmp));
-					arr_len = put_var_integer(tmp,
-					    pub_response.variable_header
-					        .pub_arrc.properties.len);
-					nng_msg_append(dest_msg, tmp, arr_len);
-
-					// reason string
-					append_bytes_with_type(dest_msg,
-					    REASON_STRING,
-					    (uint8_t *) pub_response
-					        .variable_header.pub_arrc
-					        .properties.content.pub_arrc
-					        .reason_string.body,
-					    pub_response.variable_header
-					        .pub_arrc.properties.content
-					        .pub_arrc.reason_string.len);
-
-					// user properties
-					append_bytes_with_type(dest_msg,
-					    USER_PROPERTY,
-					    (uint8_t *) pub_response
-					        .variable_header.pub_arrc
-					        .properties.content.pub_arrc
-					        .user_property.key,
-					    pub_response.variable_header
-					        .pub_arrc.properties.content
-					        .pub_arrc.user_property
-					        .len_key);
-					nng_msg_append(dest_msg,
-					    (uint8_t *) pub_response
-					        .variable_header.pub_arrc
-					        .properties.content.pub_arrc
-					        .user_property.val,
-					    pub_response.variable_header
-					        .pub_arrc.properties.content
-					        .pub_arrc.user_property
-					        .len_val);
-				}
-			}
+			if (PROTOCOL_VERSION_v5 == proto) { }
 #endif
 		}
 		break;
@@ -610,23 +477,19 @@ encode_pub_message(nng_msg *dest_msg, const nano_work *work,
 }
 
 reason_code
-decode_pub_message(nano_work *work)
+decode_pub_message(nano_work *work, uint8_t proto)
 {
 	uint32_t pos      = 0;
 	uint32_t used_pos = 0;
 	uint32_t len, len_of_varint;
-	uint8_t  proto;
-
-	proto = conn_param_get_protover(work->cparam);
-	if (nng_msg_cmd_type(work->msg) == CMD_PUBLISH) {
-		proto = 4;
-	}
 
 	nng_msg *                 msg        = work->msg;
 	struct pub_packet_struct *pub_packet = work->pub_packet;
 
 	uint8_t *msg_body = nng_msg_body(msg);
 	size_t   msg_len  = nng_msg_len(msg);
+
+	// print_hex("", msg_body, msg_len);
 
 	pub_packet->fixed_header =
 	    *(struct fixed_header *) nng_msg_header(msg);
@@ -648,394 +511,78 @@ decode_pub_message(nano_work *work)
 		// variable header
 		// topic length
 		NNI_GET16(msg_body + pos,
-		    pub_packet->variable_header.publish.topic_name.len);
-		pub_packet->variable_header.publish.topic_name.body =
+		    pub_packet->var_header.publish.topic_name.len);
+		pub_packet->var_header.publish.topic_name.body =
 		    (char *) copy_utf8_str(msg_body, &pos, &len);
 
-		if (pub_packet->variable_header.publish.topic_name.len > 0) {
-			if (strchr(pub_packet->variable_header.publish
-			               .topic_name.body,
+		if (pub_packet->var_header.publish.topic_name.len > 0) {
+			if (strchr(
+			        pub_packet->var_header.publish.topic_name.body,
 			        '+') != NULL ||
-			    strchr(pub_packet->variable_header.publish
-			               .topic_name.body,
+			    strchr(
+			        pub_packet->var_header.publish.topic_name.body,
 			        '#') != NULL) {
-
-				// TODO search topic alias if mqtt version
-				// = 5.0
 
 				// protocol error
 				debug_msg(
 				    "protocol error in topic:[%s], len: [%d]",
-				    pub_packet->variable_header.publish
-				        .topic_name.body,
-				    pub_packet->variable_header.publish
-				        .topic_name.len);
+				    pub_packet->var_header.publish.topic_name
+				        .body,
+				    pub_packet->var_header.publish.topic_name
+				        .len);
 
 				return PROTOCOL_ERROR;
 			}
 		}
 
-		debug_msg("topic: [%s], qos: %d",
-		    pub_packet->variable_header.publish.topic_name.body,
+		// TODO if topic_len = 0 && mqtt_version = 5.0, search topic
+		// alias from nano_db
+
+		debug_msg("topic: [%.*s], qos: %d",
+		    pub_packet->var_header.publish.topic_name.len,
+		    pub_packet->var_header.publish.topic_name.body,
 		    pub_packet->fixed_header.qos);
 
-		if (pub_packet->fixed_header.qos >
-		    0) { // extract packet_identifier while qos > 0
+		if (pub_packet->fixed_header.qos > 0) {
 			NNI_GET16(msg_body + pos,
-			    pub_packet->variable_header.publish
-			        .packet_identifier);
+			    pub_packet->var_header.publish.packet_id);
 			debug_msg("identifier: [%d]",
-			    pub_packet->variable_header.publish
-			        .packet_identifier);
+			    pub_packet->var_header.publish.packet_id);
 			pos += 2;
 		}
+		used_pos = pos;
 
-		used_pos                                           = pos;
-		pub_packet->variable_header.publish.properties.len = 0;
-
-#if SUPPORT_MQTT5_0
 		if (PROTOCOL_VERSION_v5 == proto) {
-			len_of_varint = 0;
-			pub_packet->variable_header.publish.properties.len =
-			    get_var_integer(msg_body, &len_of_varint);
-			pos += len_of_varint;
-			debug_msg("property len [%d]",
-			    pub_packet->variable_header.publish.properties
-			        .len);
-			init_pub_packet_property(pub_packet);
-			if (pub_packet->variable_header.publish.properties
-			        .len > 0) {
-				for (uint32_t i = 0;
-				     i < pub_packet->variable_header.publish
-				             .properties.len;) {
-					properties_type prop_type =
-					    get_var_integer(msg_body, &pos);
-					// TODO the same property cannot appear
-					// twice
-					switch (prop_type) {
-					case PAYLOAD_FORMAT_INDICATOR:
-						if (pub_packet->variable_header
-						        .publish.properties
-						        .content.publish
-						        .payload_fmt_indicator
-						        .has_value == false) {
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .payload_fmt_indicator
-							    .value =
-							    *(msg_body + pos);
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .payload_fmt_indicator
-							    .has_value = true;
-							++pos;
-							++i;
-						}
-						break;
-
-					case MESSAGE_EXPIRY_INTERVAL:
-						if (pub_packet->variable_header
-						        .publish.properties
-						        .content.publish
-						        .msg_expiry_interval
-						        .has_value == false) {
-							NNI_GET32(
-							    msg_body + pos,
-							    pub_packet
-							        ->variable_header
-							        .publish
-							        .properties
-							        .content
-							        .publish
-							        .msg_expiry_interval
-							        .value);
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .msg_expiry_interval
-							    .has_value = true;
-							pos += 4;
-							i += 4;
-						}
-						break;
-
-					case CONTENT_TYPE:
-						if (pub_packet->variable_header
-						        .publish.properties
-						        .content.publish
-						        .content_type.len ==
-						    0) {
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .content_type
-							    .len = get_utf8_str(
-							    &pub_packet
-							         ->variable_header
-							         .publish
-							         .properties
-							         .content
-							         .publish
-							         .content_type
-							         .body,
-							    msg_body, &pos);
-							i = i +
-							    pub_packet
-							        ->variable_header
-							        .publish
-							        .properties
-							        .content
-							        .publish
-							        .content_type
-							        .len +
-							    2;
-						}
-						break;
-
-					case TOPIC_ALIAS:
-						if (pub_packet->variable_header
-						        .publish.properties
-						        .content.publish
-						        .topic_alias
-						        .has_value == false) {
-							NNI_GET16(
-							    msg_body + pos,
-							    pub_packet
-							        ->variable_header
-							        .publish
-							        .properties
-							        .content
-							        .publish
-							        .topic_alias
-							        .value);
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .topic_alias
-							    .has_value = true;
-							pos += 2;
-							i += 2;
-						}
-						break;
-
-					case RESPONSE_TOPIC:
-						if (pub_packet->variable_header
-						        .publish.properties
-						        .content.publish
-						        .response_topic.len ==
-						    0) {
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .response_topic
-							    .len = get_utf8_str(
-							    &pub_packet
-							         ->variable_header
-							         .publish
-							         .properties
-							         .content
-							         .publish
-							         .response_topic
-							         .body,
-							    msg_body, &pos);
-							i = i +
-							    pub_packet
-							        ->variable_header
-							        .publish
-							        .properties
-							        .content
-							        .publish
-							        .content_type
-							        .len +
-							    2;
-						}
-						break;
-
-					case CORRELATION_DATA:
-						if (pub_packet->variable_header
-						        .publish.properties
-						        .content.publish
-						        .correlation_data
-						        .len == 0) {
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .correlation_data
-							    .len =
-							    get_variable_binary(
-							        &pub_packet
-							             ->variable_header
-							             .publish
-							             .properties
-							             .content
-							             .publish
-							             .correlation_data
-							             .body,
-							        msg_body +
-							            pos);
-							pos +=
-							    pub_packet
-							        ->variable_header
-							        .publish
-							        .properties
-							        .content
-							        .publish
-							        .correlation_data
-							        .len +
-							    2;
-							i +=
-							    pub_packet
-							        ->variable_header
-							        .publish
-							        .properties
-							        .content
-							        .publish
-							        .correlation_data
-							        .len +
-							    2;
-						}
-						break;
-
-					case USER_PROPERTY:
-						if (pub_packet->variable_header
-						        .publish.properties
-						        .content.publish
-						        .user_property
-						        .len_key == 0) {
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .user_property
-							    .len_key = get_utf8_str(
-							    &pub_packet
-							         ->variable_header
-							         .publish
-							         .properties
-							         .content
-							         .publish
-							         .user_property
-							         .key,
-							    msg_body, &pos);
-							i +=
-							    pub_packet
-							        ->variable_header
-							        .publish
-							        .properties
-							        .content
-							        .publish
-							        .user_property
-							        .len_key +
-							    2;
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .user_property
-							    .len_val = get_utf8_str(
-							    &pub_packet
-							         ->variable_header
-							         .publish
-							         .properties
-							         .content
-							         .publish
-							         .user_property
-							         .val,
-							    msg_body, &pos);
-							i +=
-							    pub_packet
-							        ->variable_header
-							        .publish
-							        .properties
-							        .content
-							        .publish
-							        .user_property
-							        .len_val +
-							    2;
-						}
-						break;
-
-					case SUBSCRIPTION_IDENTIFIER:
-						if (pub_packet->variable_header
-						        .publish.properties
-						        .content.publish
-						        .subscription_identifier
-						        .has_value == false) {
-							len_of_varint = 0;
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .subscription_identifier
-							    .value =
-							    get_var_integer(
-							        msg_body,
-							        &len_of_varint);
-							i += len_of_varint;
-							pub_packet
-							    ->variable_header
-							    .publish.properties
-							    .content.publish
-							    .subscription_identifier
-							    .has_value = true;
-							// Protocol error while
-							// Subscription
-							// Identifier = 0
-							if (pub_packet
-							        ->variable_header
-							        .publish
-							        .properties
-							        .content
-							        .publish
-							        .subscription_identifier
-							        .value == 0) {
-								return false;
-							}
-						}
-						break;
-
-					default:
-						i++;
-						break;
-					}
-				}
-			}
-			used_pos += pub_packet->variable_header.publish
-			                .properties.len +
-			    1;
+			pub_packet->var_header.publish.properties =
+			    decode_properties(msg, &pos,
+			        &pub_packet->var_header.publish.prop_len,
+			        false);
+			// nng_msg_proto_set_property(
+			//     msg, pub_packet->var_header.publish.properties);
+			debug_msg("property len: %d",
+			    pub_packet->var_header.publish.prop_len);
 		}
-		/* check */
-		else {
-			debug_msg("NOMQTT5ERR [%d] [%d]", proto,
-			    PROTOCOL_VERSION_v5);
-		}
-#endif
 
+		if (pos > msg_len) {
+			debug_msg("buffer-overflow: pos = %u, msg_len = %lu",
+			    pos, msg_len);
+			return PROTOCOL_ERROR;
+		}
+
+		used_pos = pos;
 		debug_msg("used pos: [%d]", used_pos);
 		// payload
-		pub_packet->payload_body.payload_len =
+		pub_packet->payload.len =
 		    (uint32_t)(msg_len - (size_t) used_pos);
 
-		if (pub_packet->payload_body.payload_len > 0) {
-			pub_packet->payload_body.payload = nng_alloc(
-			    pub_packet->payload_body.payload_len + 1);
-			memset(pub_packet->payload_body.payload, 0,
-			    pub_packet->payload_body.payload_len + 1);
-			memcpy(pub_packet->payload_body.payload,
+		if (pub_packet->payload.len > 0) {
+			pub_packet->payload.data =
+			    nng_zalloc(pub_packet->payload.len + 1);
+			memcpy(pub_packet->payload.data,
 			    (uint8_t *) (msg_body + pos),
-			    pub_packet->payload_body.payload_len);
+			    pub_packet->payload.len);
 			debug_msg("payload: [%s], len = %u",
-			    pub_packet->payload_body.payload,
-			    pub_packet->payload_body.payload_len);
+			    pub_packet->payload.data, pub_packet->payload.len);
 		}
 		break;
 
@@ -1043,94 +590,18 @@ decode_pub_message(nano_work *work)
 	case PUBREC:
 	case PUBREL:
 	case PUBCOMP:
-		NNI_GET16(msg_body + pos,
-		    pub_packet->variable_header.pub_arrc.packet_identifier);
-		pos += 2;
-		if (pub_packet->fixed_header.remain_len == 2) {
-			// Reason code can be ignored when remaining length = 2
-			// and reason code = 0x00(Success)
-			pub_packet->variable_header.pub_arrc.reason_code =
-			    SUCCESS;
-			break;
+		// here could not be reached
+		NNI_GET16(msg_body, pub_packet->var_header.pub_arrc.packet_id);
+		if (PROTOCOL_VERSION_v5 == proto) {
+			pos += 2;
+			pub_packet->var_header.pub_arrc.reason_code =
+			    *(msg_body + pos);
+			pos++;
+			pub_packet->var_header.pub_arrc.properties =
+			    decode_properties(msg, &pos,
+			        &pub_packet->var_header.pub_arrc.prop_len,
+			        false);
 		}
-		pub_packet->variable_header.pub_arrc.reason_code =
-		    *(msg_body + pos);
-		++pos;
-#if SUPPORT_MQTT5_0
-		if (pub_packet->fixed_header.remain_len > 4) {
-			pub_packet->variable_header.pub_arrc.properties.len =
-			    get_var_integer(msg_body, &pos);
-			for (uint32_t i = 0;
-			     i < pub_packet->variable_header.pub_arrc
-			             .properties.len;) {
-				properties_type prop_type =
-				    get_var_integer(msg_body, &pos);
-				switch (prop_type) {
-				case REASON_STRING:
-					pub_packet->variable_header.pub_arrc
-					    .properties.content.pub_arrc
-					    .reason_string.len = get_utf8_str(
-					    &pub_packet->variable_header
-					         .pub_arrc.properties.content
-					         .pub_arrc.reason_string.body,
-					    msg_body, &pos);
-					i += pub_packet->variable_header
-					         .pub_arrc.properties.content
-					         .pub_arrc.reason_string.len +
-					    2;
-					break;
-
-				case USER_PROPERTY:
-					if (pub_packet->variable_header
-					        .pub_arrc.properties.content
-					        .pub_arrc.user_property
-					        .len_key != 0) {
-						pub_packet->variable_header
-						    .pub_arrc.properties
-						    .content.pub_arrc
-						    .user_property
-						    .len_key = get_utf8_str(
-						    &pub_packet
-						         ->variable_header
-						         .pub_arrc.properties
-						         .content.pub_arrc
-						         .user_property.key,
-						    msg_body, &pos);
-						i +=
-						    pub_packet->variable_header
-						        .pub_arrc.properties
-						        .content.pub_arrc
-						        .user_property
-						        .len_key +
-						    2;
-						pub_packet->variable_header
-						    .pub_arrc.properties
-						    .content.pub_arrc
-						    .user_property
-						    .len_val = get_utf8_str(
-						    &pub_packet
-						         ->variable_header
-						         .pub_arrc.properties
-						         .content.pub_arrc
-						         .user_property.val,
-						    msg_body, &pos);
-						i +=
-						    pub_packet->variable_header
-						        .pub_arrc.properties
-						        .content.pub_arrc
-						        .user_property
-						        .len_val +
-						    2;
-					}
-					break;
-
-				default:
-					i++;
-					break;
-				}
-			}
-		}
-#endif
 		break;
 
 	default:
@@ -1151,11 +622,11 @@ static char *
 bytes_to_str(const unsigned char *src, char *dest, int src_len)
 {
 	int  i;
-	char szTmp[3] = { 0 };
+	char szTmp[4] = { 0 };
 
 	for (i = 0; i < src_len; i++) {
-		sprintf(szTmp, "%02X", (unsigned char) src[i]);
-		memcpy(dest + i * 2, szTmp, 2);
+		sprintf(szTmp, "%02X ", src[i]);
+		memcpy(dest + (i * 3), szTmp, 3);
 	}
 	return dest;
 }
@@ -1164,7 +635,7 @@ static void
 print_hex(const char *prefix, const unsigned char *src, int src_len)
 {
 	if (src_len > 0) {
-		char *dest = (char *) nng_alloc(src_len * 2);
+		char *dest = (char *) nng_zalloc(src_len * 3 + 1);
 
 		if (dest == NULL) {
 			debug_msg("alloc fail!");
@@ -1174,29 +645,26 @@ print_hex(const char *prefix, const unsigned char *src, int src_len)
 
 		debug_msg("%s%s", prefix, dest);
 
-		nng_free(dest, src_len * 2);
+		nng_free(dest, src_len * 3 + 1);
 	}
 }
 
-void
-init_pub_packet_property(struct pub_packet_struct *pub_packet)
+#ifdef STATISTICS
+uint64_t
+nanomq_get_message_in()
 {
-	pub_packet->variable_header.publish.properties.content.publish
-	    .payload_fmt_indicator.has_value = false;
-	pub_packet->variable_header.publish.properties.content.publish
-	    .msg_expiry_interval.has_value = false;
-	pub_packet->variable_header.publish.properties.content.publish
-	    .response_topic.len = 0;
-	pub_packet->variable_header.publish.properties.content.publish
-	    .topic_alias.has_value = 0;
-	pub_packet->variable_header.publish.properties.content.publish
-	    .content_type.len = 0;
-	pub_packet->variable_header.publish.properties.content.publish
-	    .correlation_data.len = 0;
-	pub_packet->variable_header.publish.properties.content.publish
-	    .user_property.len_key = 0;
-	pub_packet->variable_header.publish.properties.content.publish
-	    .user_property.len_val = 0;
-	pub_packet->variable_header.publish.properties.content.publish
-	    .subscription_identifier.has_value = false;
+	return g_message_in;
 }
+
+uint64_t
+nanomq_get_message_out()
+{
+	return g_message_out;
+}
+
+uint64_t
+nanomq_get_message_drop()
+{
+	return g_message_drop;
+}
+#endif

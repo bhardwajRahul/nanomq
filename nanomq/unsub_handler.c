@@ -9,13 +9,14 @@
 #include "include/unsub_handler.h"
 #include "include/nanomq.h"
 #include "include/sub_handler.h"
+#include "nng/protocol/mqtt/mqtt_parser.h"
 #include <nanolib.h>
 #include <nng.h>
 #include <protocol/mqtt/mqtt.h>
-#include <protocol/mqtt/mqtt_parser.h>
+#define SUPPORT_MQTT5_0 1
 
-uint8_t
-decode_unsub_message(nano_work *work)
+int
+decode_unsub_msg(nano_work *work)
 {
 	uint8_t *variable_ptr;
 	uint8_t *payload_ptr;
@@ -23,7 +24,7 @@ decode_unsub_message(nano_work *work)
 	uint32_t bpos = 0; // pos in payload
 
 	uint32_t len_of_varint = 0, len_of_property = 0, len_of_properties = 0;
-	uint32_t len_of_str, len_of_topic;
+	uint32_t len_of_str = 0, len_of_topic;
 
 	packet_unsubscribe *unsub_pkt     = work->unsub_pkt;
 	nng_msg *           msg           = work->msg;
@@ -42,37 +43,7 @@ decode_unsub_message(nano_work *work)
 	// Mqtt_v5 include property
 #if SUPPORT_MQTT5_0
 	if (PROTOCOL_VERSION_v5 == proto_ver) {
-		// length of property in variable
-		len_of_properties =
-		    get_var_integer(variable_ptr, &len_of_varint);
-		vpos += len_of_varint;
-
-		if (len_of_properties > 0) {
-			while (1) {
-				property_id = variable_ptr[vpos];
-				switch (property_id) {
-				case USER_PROPERTY:
-					// key
-					len_of_str = get_utf8_str(
-					    &(unsub_pkt->user_property.strpair
-					            .key),
-					    variable_ptr, &vpos);
-					unsub_pkt->user_property.strpair
-					    .len_key = len_of_str;
-					// value
-					len_of_str = get_utf8_str(
-					    &(unsub_pkt->user_property.strpair
-					            .val),
-					    variable_ptr, &vpos);
-					unsub_pkt->user_property.strpair
-					    .len_val = len_of_str;
-				default:
-					if (vpos > remaining_len) {
-						debug_msg("ERROR_IN_LEN_VPOS");
-					}
-				}
-			}
-		}
+		unsub_pkt->properties = decode_properties(msg, &vpos, &unsub_pkt->prop_len, false);
 	}
 #endif
 
@@ -126,11 +97,11 @@ decode_unsub_message(nano_work *work)
 			break;
 		}
 	}
-	return SUCCESS;
+	return 0;
 }
 
-uint8_t
-encode_unsuback_message(nng_msg *msg, nano_work *work)
+int
+encode_unsuback_msg(nng_msg *msg, nano_work *work)
 {
 	nng_msg_clear(msg);
 
@@ -153,7 +124,9 @@ encode_unsuback_message(nng_msg *msg, nano_work *work)
 
 #if SUPPORT_MQTT5_0
 	if (PROTOCOL_VERSION_v5 == proto_ver) {
-		nng_msg_append(msg, property_len, 1);
+		// nng_msg_append(msg, property_len, 1);
+		//TODO set property if necessary 
+		encode_properties(msg, NULL, CMD_UNSUBACK);
 	}
 
 	// handle payload
@@ -195,10 +168,10 @@ encode_unsuback_message(nng_msg *msg, nano_work *work)
 	    remaining_len, varint[0], varint[1], varint[2], varint[3],
 	    len_of_varint, packet_id[0], packet_id[1]);
 
-	return SUCCESS;
+	return 0;
 }
 
-uint8_t
+int
 unsub_ctx_handle(nano_work *work)
 {
 	topic_node *   topic_node_t = work->unsub_pkt->node;
@@ -206,12 +179,18 @@ unsub_ctx_handle(nano_work *work)
 	char *         client_id;
 	struct client *cli     = NULL;
 	void *         cli_ctx = NULL;
+	dbtree_ctxt *  db_ctx  = NULL;
+
+	client_id = (char *) conn_param_get_clientid(
+	    (conn_param *) nng_msg_get_conn_param(work->msg));
+	uint32_t clientid_key = DJBHashn(client_id, strlen(client_id));
 
 	// delete ctx_unsub in treeDB
 	while (topic_node_t) {
-		client_id = (char *) conn_param_get_clientid(
-		    (conn_param *) nng_msg_get_conn_param(work->msg));
-		uint32_t clientid_key = DJBHashn(client_id, strlen(client_id));
+		if (topic_node_t->it->topic_filter.len == 0) {
+			topic_node_t = topic_node_t->next;
+			continue;
+		}
 
 		// parse topic string
 		topic_str =
@@ -223,7 +202,12 @@ unsub_ctx_handle(nano_work *work)
 		debug_msg(
 		    "find client [%s] in topic [%s].", client_id, topic_str);
 
-		cli_ctx = dbtree_delete_client(work->db, topic_str, clientid_key, work->pid.id);
+		db_ctx = dbtree_delete_client(
+		    work->db, topic_str, clientid_key, work->pid.id);
+		if (db_ctx) {
+			cli_ctx = db_ctx->ctxt;
+			dbtree_delete_ctxt(db_ctx);
+		}
 		dbhash_del_topic(work->pid.id, topic_str);
 
 		if (cli_ctx != NULL) { // find the topic
@@ -245,7 +229,7 @@ unsub_ctx_handle(nano_work *work)
 	//	print_db_tree(work->db);
 
 	debug_msg("end of unsub ctx handle.\n");
-	return SUCCESS;
+	return 0;
 }
 
 void

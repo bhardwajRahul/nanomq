@@ -19,6 +19,12 @@ Github repository address: <https://github.com/nanomq/nanomq>
 
 [Quick Start](./quick-start.md)
 
-[Configuration](./configuration.md)
+[Configuration](./config-description.md)
+
+[Build Options](./build-options.md)
+
+[HTTP APIs](./http-api.md)
+
+[Toolkit](./toolkit.md)
 
 [Test Report](./test-report.md)

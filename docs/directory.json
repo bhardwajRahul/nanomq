@@ -14,7 +14,19 @@
     },
     {
       "title": "配置说明",
-      "path": "configuration"
+      "path": "config-description"
+    },
+    {
+      "title": "编译选项",
+      "path": "build-options"
+    },
+    {
+      "title": "HTTP APIs",
+      "path": "http-api"
+    },
+    {
+      "title": "工具集",
+      "path": "toolkit"
     },
     {
       "title": "测试报告",
@@ -31,12 +43,24 @@
       "path": "quick-start"
     },
     {
+      "title": "Configuration",
+      "path": "config-description"
+    },
+    {
       "title": "Features",
       "path": "features"
     },
     {
-      "title": "Configuration",
-      "path": "configuration"
+      "title": "Build Options",
+      "path": "build-options"
+    },
+    {
+      "title": "HTTP APIs",
+      "path": "http-api"
+    },
+    {
+      "title": "TOOLKIT",
+      "path": "toolkit"
     },
     {
       "title": "Test Report",

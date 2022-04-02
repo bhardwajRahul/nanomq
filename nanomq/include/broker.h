@@ -7,13 +7,26 @@
 #include <nng/nng.h>
 #include <nng/protocol/mqtt/mqtt.h>
 #include <nng/supplemental/util/platform.h>
+#include <nng/mqtt/packet.h>
+#include <stdatomic.h>
 
 #define PROTO_MQTT_BROKER 0x00
 #define PROTO_MQTT_BRIDGE 0x01
+#define STATISTICS
 
 typedef struct work nano_work;
 struct work {
-	enum { INIT, RECV, WAIT, SEND, RESEND, FREE, NOTIFY, BRIDGE } state;
+	enum {
+		INIT,
+		RECV,
+		WAIT,
+		SEND,
+		RESEND,
+		FREE,
+		NOTIFY,
+		BRIDGE,
+		END
+	} state;
 	// 0x00 mqtt_broker
 	// 0x01 mqtt_bridge
 	uint8_t   proto;
@@ -29,15 +42,18 @@ struct work {
 	dbtree *  db_ret;
 	conf *    config;
 
-	struct pipe_content *      pipe_ct;
-	conn_param *               cparam;
-	struct pub_packet_struct * pub_packet;
-	struct packet_subscribe *  sub_pkt;
-	struct packet_unsubscribe *unsub_pkt;
+	struct pipe_content *     pipe_ct;
+	conn_param *              cparam;
+	struct pub_packet_struct *pub_packet;
+	packet_subscribe *        sub_pkt;
+	packet_unsubscribe *      unsub_pkt;
 };
 
 struct client_ctx {
-	nng_pipe                 pid;
+	nng_pipe pid;
+#ifdef STATISTICS
+	atomic_uint recv_cnt;
+#endif
 	conn_param *             cparam;
 	struct packet_subscribe *sub_pkt;
 	uint8_t                  proto_ver;
@@ -50,6 +66,11 @@ int broker_stop(int argc, char **argv);
 int broker_restart(int argc, char **argv);
 int broker_dflt(int argc, char **argv);
 
+#ifdef STATISTICS
+uint64_t nanomq_get_message_in(void);
+uint64_t nanomq_get_message_out(void);
+uint64_t nanomq_get_message_drop(void);
+#endif
 dbtree *get_broker_db(void);
 
 #endif
