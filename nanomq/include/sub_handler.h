@@ -6,18 +6,46 @@
 
 #include "broker.h"
 
-uint8_t decode_sub_message(nano_work *);
-uint8_t encode_suback_message(nng_msg *, nano_work *);
-uint8_t sub_ctx_handle(nano_work *);
-// free mem about one topic in sub_ctx
-void del_sub_ctx(void *, char *);
-// free all mem about sub_ctx
-void destroy_sub_ctx(void *);
-void destroy_sub_pkt(packet_subscribe *, uint8_t);
-void init_sub_property(packet_subscribe *);
+typedef struct {
+	uint32_t pid;
+	dbtree *db;
+}  sub_destroy_info;
 
-// functions about clean session
-int  cache_session(char *, conn_param *, uint32_t, void *);
-int  restore_session(char *, conn_param *, uint32_t, void *);
+/*
+ * Use to decode sub msg.
+ */
+int decode_sub_msg(nano_work *);
+
+/*
+ * Use to encode an ack for sub msg
+ */
+int encode_suback_msg(nng_msg *, nano_work *);
+
+int sub_ctx_handle(nano_work *);
+
+/*
+ * Delete a client ctx from topic node in dbtree
+ */
+int sub_ctx_del(void *db, char *topic, uint32_t pid);
+
+/*
+ * Free the client ctx
+ */
+void sub_ctx_free(client_ctx *);
+
+/*
+ * A wrap for sub ctx free
+ */
+void * wrap_sub_ctx_free_cb(void *arg);
+
+/*
+ * Free a packet_subscribe.
+ */
+void sub_pkt_free(packet_subscribe *);
+
+/*
+ * Delete all refs in dbtree about client ctx
+ */
+void destroy_sub_client(uint32_t pid, dbtree * db);
 
 #endif

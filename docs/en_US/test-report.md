@@ -4,7 +4,7 @@
 
 [NanoMQ](https://nanomq.io/) is an open source project for edge computing that started in July 2020 and is the next generation of lightweight, high-performance MQTT messaging broker for the IoT edge computing scenario.
 
-Github repository address: <https://github.com/nanomq/nanomq>
+Github repository address: <https://github.com/emqx/nanomq>
 
 NanoMQ aims to deliver simple and powerful message-centric services for different edge computing platforms; strives to remove the gap between hardware development and cloud computing; connects the physical world and digital intelligence from the open source community; thus popularizing edge computing applications and helping to connect everything.
 
@@ -12,7 +12,7 @@ NanoMQ in collaboration with NNG. Relying on NNG's excellent network API design,
 
 NanoMQ currently has the following functions and features:
 
-Full support for the MQTT 3.1.1 protocol. High compatibility and portability as the project relies only on the native POSIX API and is developed purely in C/C++. NanoMQ is internally fully asynchronous IO and multi-threaded parallelism, so there is good support for SMP while achieving low latency and high throughput. It is cost-effective in terms of resource usage and is suitable for all types of edge computing platforms.
+Full support for the MQTT 3.1.1/5.0 protocol. High compatibility and portability as the project relies only on the native POSIX API and is developed purely in C. NanoMQ is internally fully asynchronous IO and multi-threaded parallelism, so there is good support for SMP while achieving low latency and high throughput. It is cost-effective in terms of resource usage and is suitable for all types of edge computing platforms.
 
 
 
@@ -264,7 +264,7 @@ This configuration takes up around 3000 kb of memory on startup.
 
 ### Test results
 
-Publishing the message side
+<details><summary>Publishing the message side</summary>
 
 /emqtt_bench pub -h 192.168.24.221 -c 10 -I 5 -i 30 -p 1883 -t msg -q 0 -V 4 -s 16 -L 50000
 
@@ -322,7 +322,9 @@ sent(24001): total=47274, rate=1999(msg/sec)
 
 sent(25001): total=50000, rate=2001(msg/sec)
 
-Receiving the message side
+</details>
+
+<details><summary>Receiving the message side</summary>
 
 ./emqtt_bench sub -h 192.168.24.221 -c 500 -i 10 -p 1883 -t msg -q 0 -V 4
 
@@ -414,7 +416,9 @@ recv(51064): total=24866633, rate=1204424(msg/sec)
 
 recv(52000): total=25000000, rate=133367(msg/sec)
 
-QoS 1:
+</details>
+
+<details><summary>QoS 1</summary>
 
 connected: 500
 
@@ -552,6 +556,9 @@ recv(81001): total=24998319, rate=3490(msg/sec)
 
 recv(82001): total=25000000, rate=1681(msg/sec)
 
+</details>
+
+
 ### System monitoring information
 
 System resource consumption was essentially the same as in Server Environment 1, with final memory consumption of 200M and all CPU cores are running at almost full capacity.
@@ -608,3 +615,11 @@ Server environment 2
 ### Test result analysis
 
 As can be seen, the user state time of the CPU becomes significantly more in single-core scenarios. This is because NanoMQ's multi-threaded optimization for multi-core scenarios has been specifically made to support SMP, which significantly reduces the number of CPU context switches. However, the large number of individually sent and received tasks in single-core scenarios does not fully exploit this advantage.
+
+## Summary
+
+NanoMQ architecture diagram
+
+![img](./images/nanomq.001.png)
+
+The bottom layer of NanoMQ reads the network data in the kernel through single-threaded Epoll, and handles the parsing of link messages and the production of asynchronous messages at the transport layer. Quickly reply to QoS messages after performing IO Batch at the same time. After the Connect package processing is completed and the PIPE is established, the message is forwarded to the protocol layer for processing through asynchronous IO. The protocol layer is responsible for the management of the message queue and the triggering of the timer. Finally, the asynchronous message is passed through AIO and then global logical processing and message routing are performed at the application layer.

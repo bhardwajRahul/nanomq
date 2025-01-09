@@ -1,5 +1,4 @@
-#define FW_EV_VER_MAJOR 6
-#define FW_EV_VER_MINOR 3
-#define FW_EV_VER_PATCH 0
-#define FW_EV_VER_ID_SHORT "3"
-#define FW_EV_VER_ID_LONG "100"
+#define NANO_VER_MAJOR 0
+#define NANO_VER_MINOR 23
+#define NANO_VER_PATCH 2
+#define NANO_VER_ID_SHORT "2"
