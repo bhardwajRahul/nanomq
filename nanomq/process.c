@@ -8,16 +8,17 @@
 //
 
 #include "include/nanomq.h"
-
 #include "include/process.h"
-
-#include <errno.h>
-#include <fcntl.h>
-#include <paths.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "nng/supplemental/nanolib/log.h"
+
+#ifndef NANO_PLATFORM_WINDOWS
+#include <paths.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -36,7 +37,7 @@ process_send_signal(int pid, int signal)
 	if (pid < 1)
 		return 0;
 
-	debug_msg("pid = %i, signal = %i", pid, signal);
+	log_debug("pid = %i, signal = %i", pid, signal);
 	return kill(pid, signal);
 }
 
@@ -50,12 +51,12 @@ pidgrp_send_signal(int pid, int signal)
 
 	gpid = getpgid(pid);
 	if (gpid < 0) {
-		debug_msg("pid = %i: unable to retrieve gpid: %s", pid,
+		log_debug("pid = %i: unable to retrieve gpid: %s", pid,
 		    strerror(errno));
 		return 0;
 	}
 
-	debug_msg("pid = %i: gpid = %i, signal = %i", pid, gpid, signal);
+	log_debug("pid = %i: gpid = %i, signal = %i", pid, gpid, signal);
 	return kill(-gpid, signal);
 }
 
@@ -114,3 +115,33 @@ process_create_child(int (*child_run)(void *), void *data)
 		return pid;
 	}
 }
+
+#else
+
+int
+process_is_alive(int pid)
+{
+	return 0;
+}
+
+int
+process_send_signal(int pid, int signal)
+{
+	return 0;
+}
+
+int
+process_daemonize(void)
+{
+	fprintf(stderr, "Not support on Windows\n");
+	return -1;
+}
+
+int
+process_create_child(int (*child_run)(void *), void *data)
+{
+	fprintf(stderr, "Not support on Windows\n");
+	return -1;
+}
+
+#endif

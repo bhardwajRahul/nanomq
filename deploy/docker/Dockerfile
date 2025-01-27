@@ -1,18 +1,28 @@
-FROM gcc:10 as builder
+FROM alpine:3.16 as builder
 
 COPY . /nanomq
-COPY deploy/docker/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
 
-RUN apt update && apt install -y cmake ninja-build
+RUN apk add gcc cmake make musl-dev g++
 
 WORKDIR /nanomq/build
 
-RUN cmake -G Ninja -DNOLOG=1 .. && ninja install
+RUN cmake .. && make
 
-RUN ln -s /nanomq/build/nanomq/nanomq /usr/bin/nanomq
+FROM alpine:3.16
+
+COPY --from=builder /nanomq/build/nanomq/nanomq /usr/local/nanomq/
+COPY --from=builder /nanomq/build/nanomq_cli/nanomq_cli /usr/local/nanomq/
+COPY --from=builder /usr/lib/libgcc_s.so.1 /usr/lib/
+COPY etc/nanomq.conf /etc/nanomq.conf
+COPY deploy/docker/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+
+WORKDIR /usr/local/nanomq
+
+RUN ln -s /usr/local/nanomq/nanomq /usr/bin/nanomq && \
+    ln -s /usr/local/nanomq/nanomq_cli /usr/bin/nanomq_cli
 
 EXPOSE 1883
 
 ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]
 
-CMD ["--url", "nmq-tcp://0.0.0.0:1883"]
+CMD ["--conf", "/etc/nanomq.conf"]
